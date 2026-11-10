@@ -1,10 +1,10 @@
-import { usePref } from '../lib/prefs';
-import { Area, Bar, CartesianGrid, ComposedChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { Area, Bar, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import type { Kpis, Overview } from '../lib/api';
 import { useDash } from '../lib/context';
 import { bucketLabel, fmtDuration, fmtNumber, fmtPct } from '../lib/format';
+import { usePref } from '../lib/prefs';
 
-type Metric = 'visitors' | 'revenue';
+type Metric = 'visitors' | 'revenue' | 'prev';
 
 function Change({ cur, prev, invert = false }: { cur: number; prev: number; invert?: boolean }) {
   if (!prev) return <span className="text-xs text-stone-400">—</span>;
@@ -21,13 +21,20 @@ function Change({ cur, prev, invert = false }: { cur: number; prev: number; inve
 
 export function OverviewCard({ data, onLive }: { data: Overview | null; onLive: () => void }) {
   const { money } = useDash();
-  const [hidden, setHidden] = usePref<Record<Metric, boolean>>('ml_chart_hidden', { visitors: false, revenue: false });
+  const [hidden, setHidden] = usePref<Record<Metric, boolean>>('ml_chart_hidden', { visitors: false, revenue: false, prev: false });
   const c = data?.current;
   const p = data?.previous;
 
-  const kpis: { key: keyof Kpis | 'online'; label: string; value: string; invert?: boolean; metric?: Metric; dot?: string }[] = c
+  const kpis: { key: keyof Kpis | 'online'; label: string; value: string; invert?: boolean; metric?: Metric; dot?: string; sub?: string }[] = c
     ? [
-        { key: 'visitors', label: 'Visitors', value: fmtNumber(c.visitors), metric: 'visitors', dot: 'bg-visitors' },
+        {
+          key: 'visitors',
+          label: 'Visitors',
+          value: fmtNumber(c.visitors),
+          metric: 'visitors',
+          dot: 'bg-visitors',
+          sub: `${fmtNumber(c.newVisitors)} new · ${fmtNumber(c.returningVisitors)} returning`,
+        },
         { key: 'revenue', label: 'Revenue', value: money(c.revenue, true), metric: 'revenue', dot: 'bg-revenue' },
         { key: 'conversionRate', label: 'Conversion rate', value: fmtPct(c.conversionRate, c.conversionRate >= 0.1 ? 0 : 2) },
         { key: 'revenuePerVisitor', label: 'Revenue/visitor', value: money(c.revenuePerVisitor) },
@@ -54,6 +61,7 @@ export function OverviewCard({ data, onLive }: { data: Overview | null; onLive: 
             </div>
             <div className="mt-1 text-[28px] font-semibold leading-tight tracking-tight">{k.value}</div>
             <Change cur={c![k.key as keyof Kpis]} prev={p![k.key as keyof Kpis]} invert={k.invert} />
+            {k.sub && <div className="mt-0.5 text-[11px] text-stone-400">{k.sub}</div>}
           </button>
         ))}
         {data && (
@@ -68,7 +76,18 @@ export function OverviewCard({ data, onLive }: { data: Overview | null; onLive: 
         {!data && <div className="col-span-full h-[98px] animate-pulse bg-stone-50" />}
       </div>
 
-      <div className="h-[340px] px-2 pb-3 pt-6 sm:px-4">
+      <div className="flex items-center justify-end gap-3 px-4 pt-3 text-xs text-stone-500">
+        <button
+          type="button"
+          className={`inline-flex items-center gap-1.5 ${hidden.prev ? 'opacity-40' : ''}`}
+          onClick={() => setHidden((h) => ({ ...h, prev: !h.prev }))}
+        >
+          <span className="h-0.5 w-4 border-t-2 border-dashed border-stone-400" />
+          Prior period
+        </button>
+      </div>
+
+      <div className="h-[340px] px-2 pb-3 pt-2 sm:px-4">
         {data && (
           <ResponsiveContainer width="100%" height="100%">
             <ComposedChart data={data.series} margin={{ top: 5, right: 5, left: 0, bottom: 0 }}>
@@ -117,8 +136,10 @@ export function OverviewCard({ data, onLive }: { data: Overview | null; onLive: 
                     <div className="card min-w-[180px] px-4 py-3 text-sm">
                       <div className="mb-2 font-medium">{bucketLabel(d.bucket, g, true)}</div>
                       <Row color="bg-visitors" label="Visitors" value={fmtNumber(d.visitors)} />
+                      {!hidden.prev && <Row color="bg-stone-300" label="Visitors (prior)" value={fmtNumber(d.visitors_prev ?? 0)} />}
                       <Row color="bg-stone-300" label="Pageviews" value={fmtNumber(d.pageviews)} />
                       <Row color="bg-revenue" label="Revenue" value={money(d.revenue)} />
+                      {!hidden.prev && <Row color="bg-revenueSoft" label="Revenue (prior)" value={money(d.revenue_prev ?? 0)} />}
                       {d.payments > 0 && <Row color="bg-revenueSoft" label="Payments" value={String(d.payments)} />}
                     </div>
                   );
@@ -126,6 +147,19 @@ export function OverviewCard({ data, onLive }: { data: Overview | null; onLive: 
               />
               {!hidden.revenue && (
                 <Bar yAxisId="r" dataKey="revenue" fill="#e07b5f" radius={[4, 4, 0, 0]} maxBarSize={36} isAnimationActive={false} />
+              )}
+              {!hidden.prev && !hidden.revenue && (
+                <Line
+                  yAxisId="r"
+                  type="monotone"
+                  dataKey="revenue_prev"
+                  stroke="#e07b5f"
+                  strokeWidth={1.5}
+                  strokeDasharray="4 4"
+                  strokeOpacity={0.45}
+                  dot={false}
+                  isAnimationActive={false}
+                />
               )}
               {!hidden.visitors && (
                 <Area
@@ -137,6 +171,19 @@ export function OverviewCard({ data, onLive }: { data: Overview | null; onLive: 
                   fill="url(#vis)"
                   dot={false}
                   activeDot={{ r: 4, fill: '#7cb1ea', stroke: '#fff', strokeWidth: 2 }}
+                  isAnimationActive={false}
+                />
+              )}
+              {!hidden.prev && !hidden.visitors && (
+                <Line
+                  yAxisId="v"
+                  type="monotone"
+                  dataKey="visitors_prev"
+                  stroke="#7cb1ea"
+                  strokeWidth={1.5}
+                  strokeDasharray="4 4"
+                  strokeOpacity={0.45}
+                  dot={false}
                   isAnimationActive={false}
                 />
               )}

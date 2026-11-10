@@ -4,7 +4,7 @@ import { navigate } from '../App';
 import { Favicon } from '../components/Icons';
 import { CurrencySelect, TimezoneSelect } from '../components/SiteFields';
 import { buildAiPrompt } from '../lib/aiPrompt';
-import { api, type Site } from '../lib/api';
+import { api, type ShareLink, type Site } from '../lib/api';
 import { fmtMoney } from '../lib/format';
 
 const DOCS = 'https://github.com/surendrapandar/minilytics#';
@@ -183,6 +183,8 @@ window.minilytics('identify', { email: user.email, name: user.name });`}</Code>
       <Revenue site={site} origin={origin} form={form} set={set} save={save} onKeyRotated={(api_key) => setSite({ ...site, api_key })} />
 
       <LinkBuilder domain={site.domain} />
+
+      <ShareLinksSection siteId={site.id} origin={origin} />
 
       <Section title="General">
         <div className="grid gap-4 sm:grid-cols-2">
@@ -537,6 +539,77 @@ function LinkBuilder({ domain }: { domain: string }) {
           <CopyField value={built} />
         </div>
       )}
+    </Section>
+  );
+}
+
+function ShareLinksSection({ siteId, origin }: { siteId: string; origin: string }) {
+  const [links, setLinks] = useState<ShareLink[] | null>(null);
+  const [label, setLabel] = useState('Read-only link');
+  const [busy, setBusy] = useState(false);
+  const [created, setCreated] = useState<string | null>(null);
+
+  const load = () => api<ShareLink[]>(`/api/sites/${siteId}/share-links`).then(setLinks);
+  useEffect(() => {
+    load().catch(() => setLinks([]));
+  }, [siteId]);
+
+  async function create() {
+    setBusy(true);
+    try {
+      const link = await api<ShareLink>(`/api/sites/${siteId}/share-links`, { method: 'POST', json: { label, days: 30 } });
+      setCreated(`${origin}/share/${link.token}`);
+      setLabel('Read-only link');
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Section
+      title="Share dashboard"
+      desc="Create a read-only link anyone can open without logging in. Links expire after 30 days by default."
+    >
+      <div className="flex flex-wrap gap-2">
+        <input className="input max-w-xs" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Link label" />
+        <button className="btn-dark" disabled={busy} onClick={create}>
+          {busy ? 'Creating…' : 'Create share link'}
+        </button>
+      </div>
+      {created && (
+        <div className="mt-3">
+          <CopyField value={created} />
+          <p className="mt-1 text-xs text-emerald-600">New link ready — copy it now.</p>
+        </div>
+      )}
+      <ul className="mt-4 space-y-2">
+        {(links ?? []).map((l) => (
+          <li key={l.token} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-stone-200 px-3 py-2 text-sm">
+            <div className="min-w-0">
+              <div className="font-medium">{l.label || 'Read-only link'}</div>
+              <div className="truncate text-xs text-stone-500">
+                /share/{l.token}
+                {l.expires_at ? ` · expires ${new Date(l.expires_at).toLocaleDateString()}` : ''}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <CopyButton text={`${origin}/share/${l.token}`} className={`${SMALL_BUTTON} border border-stone-200 bg-white hover:bg-stone-100`} />
+              <button
+                className={`${SMALL_BUTTON} border border-red-100 text-red-600 hover:bg-red-50`}
+                onClick={async () => {
+                  await api(`/api/sites/${siteId}/share-links/${l.token}`, { method: 'DELETE' });
+                  if (created?.endsWith(l.token)) setCreated(null);
+                  await load();
+                }}
+              >
+                Revoke
+              </button>
+            </div>
+          </li>
+        ))}
+        {links && !links.length && <li className="text-sm text-stone-500">No share links yet.</li>}
+      </ul>
     </Section>
   );
 }

@@ -102,7 +102,7 @@ function markerElement(v: LiveVisitor, onClick: () => void): HTMLElement {
 }
 
 export default function LiveView({ onClose }: { onClose: () => void }) {
-  const { site, money, openVisitor } = useDash();
+  const { site, money, openVisitor, apiPrefix } = useDash();
   const rootRef = useRef<HTMLDivElement>(null);
   const mapEl = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -124,7 +124,7 @@ export default function LiveView({ onClose }: { onClose: () => void }) {
   // ---- data polling
   const load = useCallback(async () => {
     try {
-      const d = await api<Realtime>(`/api/sites/${site.id}/realtime`);
+      const d = await api<Realtime>(`${apiPrefix}/realtime`);
       const vids = new Set(d.visitors.map((v) => v.visitor_id));
       const pays = new Set(d.feed.filter((f) => f.type === 'payment').map((f) => f.id));
       if (knownVisitors.current && soundRef.current) {
@@ -138,7 +138,7 @@ export default function LiveView({ onClose }: { onClose: () => void }) {
     } catch (e) {
       setError((e as Error).message);
     }
-  }, [site.id]);
+  }, [apiPrefix]);
 
   useEffect(() => {
     load();

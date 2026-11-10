@@ -6,7 +6,7 @@ import { Modal } from '../components/Modal';
 import { CurrencySelect, TimezoneSelect } from '../components/SiteFields';
 import { Area, Bar, ComposedChart, ResponsiveContainer, YAxis } from 'recharts';
 import { currencyDecimals } from '../../shared/currency';
-import { api, type Site, type SiteSpark } from '../lib/api';
+import { api, type Site, type SiteSpark, type SitesOverview } from '../lib/api';
 import { fmtMoney, fmtNumber } from '../lib/format';
 import { usePref } from '../lib/prefs';
 import { useApi } from '../lib/useApi';
@@ -25,7 +25,9 @@ export function Sites() {
   const [period, setPeriod] = usePref('ml_sites_period', '30d');
   const [reloadKey, setReloadKey] = useState(0);
   const { data: sites, loading: loadingSites } = useApi<Site[]>('/api/sites', reloadKey);
-  const { data: sparks, loading: loadingSparks } = useApi<SiteSpark[]>(`/api/sites-overview?period=${period}`, reloadKey);
+  const { data: overview, loading: loadingSparks } = useApi<SitesOverview>(`/api/sites-overview?period=${period}`, reloadKey);
+  const sparks = overview?.sites ?? null;
+  const totals = overview?.totals;
   const loading = loadingSites || loadingSparks;
 
   useEffect(() => {
@@ -83,6 +85,24 @@ export function Sites() {
           </button>
         </div>
       </div>
+
+      {totals && sites && sites.length > 0 && (
+        <p className="mt-4 text-sm text-stone-500">
+          Portfolio · <span className="font-medium text-ink">{fmtNumber(totals.visitors)} visitors</span>
+          {sites.every((s) => s.currency === sites[0].currency) && (
+            <>
+              {' '}
+              · <span className="font-medium text-ink">{fmtMoney(totals.revenue, sites[0].currency, currencyDecimals(sites[0].currency), true)}</span>
+            </>
+          )}
+          {totals.online > 0 && (
+            <>
+              {' '}
+              · <span className="font-medium text-emerald-600">{totals.online} online</span>
+            </>
+          )}
+        </p>
+      )}
 
       <div className="mt-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {sites && sites.length > 1 && <AllSitesCard sites={sites} sparks={sparks} />}

@@ -33,6 +33,8 @@ export function renderLabel(dim: string, row: Pick<BreakdownRow, 'label' | 'extr
           {text(l ?? 'Direct/None')}
         </>
       );
+    case 'product':
+      return text(l ?? 'Unknown product');
     case 'country':
       return (
         <>
@@ -139,14 +141,14 @@ function Bars({ rows, dim, tab, sort, limit, onPick }: { rows: BreakdownRow[]; d
 }
 
 export function Panel({ tabs }: { tabs: TabDef[] }) {
-  const { site, q, reloadKey, addFilter, money } = useDash();
+  const { q, reloadKey, addFilter, money, apiPrefix } = useDash();
   const [saved, setActive] = usePref(`ml_tab_${tabs[0].dim}`, tabs[0].dim);
   const active = tabs.some((t) => t.dim === saved) ? saved : tabs[0].dim;
   const [sort, setSort] = usePref<'visitors' | 'revenue'>(`ml_sort_${tabs[0].dim}`, 'visitors');
   const [details, setDetails] = useState(false);
   const [search, setSearch] = useState('');
   const tab = tabs.find((t) => t.dim === active)!;
-  const { data, loading, error } = useApi<BreakdownRow[]>(`/api/sites/${site.id}/breakdown?${qs(q, { dim: active })}`, reloadKey);
+  const { data, loading, error } = useApi<BreakdownRow[]>(`${apiPrefix}/breakdown?${qs(q, { dim: active })}`, reloadKey);
 
   const pick = (r: BreakdownRow) => {
     if (!tab.filter) return;

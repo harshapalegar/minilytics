@@ -9,6 +9,9 @@ export interface Dash {
   money: (minor: number, compact?: boolean) => string;
   addFilter: (key: string, value: string) => void;
   openVisitor: (visitorId: string) => void;
+  /** API path prefix for this view, e.g. `/api/sites/abc` or `/api/share/token`. */
+  apiPrefix: string;
+  readOnly?: boolean;
 }
 
 export const DashContext = createContext<Dash | null>(null);

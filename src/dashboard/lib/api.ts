@@ -45,6 +45,11 @@ export interface SiteSpark {
   series: { visitors: number; revenue: number }[];
 }
 
+export interface SitesOverview {
+  sites: SiteSpark[];
+  totals: { visitors: number; revenue: number; online: number };
+}
+
 export interface Kpis {
   visitors: number;
   sessions: number;
@@ -56,6 +61,8 @@ export interface Kpis {
   customers: number;
   conversionRate: number;
   revenuePerVisitor: number;
+  newVisitors: number;
+  returningVisitors: number;
 }
 
 export interface Overview {
@@ -65,7 +72,32 @@ export interface Overview {
   current: Kpis;
   previous: Kpis;
   online: number;
-  series: { bucket: string; visitors: number; pageviews: number; revenue: number; payments: number }[];
+  series: {
+    bucket: string;
+    visitors: number;
+    visitors_prev: number;
+    pageviews: number;
+    revenue: number;
+    revenue_prev: number;
+    payments: number;
+  }[];
+}
+
+export interface Insight {
+  id: string;
+  kind: 'kpi' | 'share' | 'mover';
+  title: string;
+  detail: string;
+  sentiment: 'up' | 'down' | 'neutral';
+  filter?: { key: string; value: string };
+  score: number;
+}
+
+export interface ShareLink {
+  token: string;
+  label: string | null;
+  created_at: number;
+  expires_at: number | null;
 }
 
 export interface BreakdownRow {

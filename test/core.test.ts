@@ -7,6 +7,7 @@ import type { Env } from '../src/worker/env';
 import { verifyStandardWebhook, verifyStripeWebhook } from '../src/worker/lib/crypto';
 import { bucketLabels, granularitiesForSpan, resolveRange, startOfDay, tzOffset } from '../src/worker/lib/time';
 import { isBot, parseUA } from '../src/worker/lib/ua';
+import { parseFilters, rankInsights } from '../src/worker/stats';
 
 describe('classify', () => {
   it('maps t.co to X / social', () => {
@@ -160,5 +161,51 @@ describe('price tiers', () => {
   });
   it('keeps selling the last buyable tier when the next price has no product yet', async () => {
     expect(await planInfo(env(12))).toMatchObject({ price: '$49', spotsLeft: null, nextPrice: '$100' });
+  });
+});
+
+describe('insights', () => {
+  const emptyKpis = {
+    visitors: 0,
+    sessions: 0,
+    pageviews: 0,
+    bounceRate: 0,
+    avgDuration: 0,
+    revenue: 0,
+    payments: 0,
+    customers: 0,
+    conversionRate: 0,
+    revenuePerVisitor: 0,
+    newVisitors: 0,
+    returningVisitors: 0,
+  };
+
+  it('parses product filters', () => {
+    expect(parseFilters(JSON.stringify({ product: 'pdt_abc', source: 'X' }))).toEqual({ product: 'pdt_abc', source: 'X' });
+  });
+
+  it('ranks revenue change and top share cards', () => {
+    const cards = rankInsights({
+      current: { ...emptyKpis, visitors: 100, revenue: 5000, customers: 10, conversionRate: 0.1, newVisitors: 60, returningVisitors: 40 },
+      previous: { ...emptyKpis, visitors: 80, revenue: 2500, customers: 5, conversionRate: 0.0625, newVisitors: 50, returningVisitors: 30 },
+      movers: [
+        { dim: 'source', filter: 'source', noun: 'referrer', label: 'ChatGPT', revenue: 2000, prevRevenue: 400, visitors: 20 },
+        { dim: 'product', filter: 'product', noun: 'product', label: 'pdt_pro', revenue: 3000, prevRevenue: 2000, visitors: 8 },
+      ],
+    });
+    expect(cards.length).toBeGreaterThan(0);
+    expect(cards.some((c) => c.id === 'kpi-revenue')).toBe(true);
+    expect(cards.some((c) => c.title.includes('ChatGPT') || c.title.includes('pdt_pro'))).toBe(true);
+    expect(cards.length).toBeLessThanOrEqual(5);
+  });
+
+  it('attaches filters on share/mover cards', () => {
+    const cards = rankInsights({
+      current: { ...emptyKpis, visitors: 50, revenue: 1000, customers: 5, conversionRate: 0.1 },
+      previous: { ...emptyKpis, visitors: 50, revenue: 1000, customers: 5, conversionRate: 0.1 },
+      movers: [{ dim: 'channel', filter: 'channel', noun: 'channel', label: 'AI', revenue: 800, prevRevenue: 100, visitors: 10 }],
+    });
+    const filtered = cards.find((c) => c.filter?.key === 'channel');
+    expect(filtered?.filter).toEqual({ key: 'channel', value: 'AI' });
   });
 });

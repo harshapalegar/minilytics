@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { navigate } from '../App';
-import type { Overview, Query, Site } from '../lib/api';
-import { dayInTz } from '../lib/format';
+import { qs, type Insight, type Overview, type Query, type Site } from '../lib/api';
+import { dayInTz, fmtMoney, fmtNumber, fmtPct } from '../lib/format';
 import { BackButton } from './BackButton';
 import { Favicon } from './Icons';
 
@@ -79,6 +79,9 @@ export function Toolbar({
   onRefresh,
   onLive,
   loading,
+  apiPrefix,
+  readOnly,
+  hideSiteSwitcher,
 }: {
   site: Site;
   sites: Site[];
@@ -88,9 +91,13 @@ export function Toolbar({
   onRefresh: () => void;
   onLive: () => void;
   loading: boolean;
+  apiPrefix: string;
+  readOnly?: boolean;
+  hideSiteSwitcher?: boolean;
 }) {
   const [from, setFrom] = useState(q.from ?? '');
   const [to, setTo] = useState(q.to ?? '');
+  const [copied, setCopied] = useState(false);
 
   const label =
     q.period === 'custom'
@@ -98,6 +105,43 @@ export function Toolbar({
         ? new Date(q.from + 'T00:00:00Z').toLocaleDateString('en', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' })
         : `${q.from} → ${q.to}`
       : PERIODS.find((p) => p.value === q.period)?.label ?? 'Last 30 days';
+
+  async function downloadCsv(kind: string, dim?: string) {
+    const extra: Record<string, string> = { kind };
+    if (dim) extra.dim = dim;
+    const res = await fetch(`${apiPrefix}/export.csv?${qs(q, extra)}`, { credentials: 'same-origin' });
+    if (!res.ok) throw new Error('Export failed');
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = res.headers.get('Content-Disposition')?.match(/filename="(.+)"/)?.[1] ?? `${kind}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  async function copySummary() {
+    if (!overview) return;
+    const cards = await fetch(`${apiPrefix}/insights?${qs(q)}`, { credentials: 'same-origin' })
+      .then((r) => r.json() as Promise<Insight[]>)
+      .catch(() => [] as Insight[]);
+    const c = overview.current;
+    const p = overview.previous;
+    const money = (n: number) => fmtMoney(n, site.currency, overview.decimals);
+    const revPct = p.revenue ? Math.round(((c.revenue - p.revenue) / p.revenue) * 100) : null;
+    const lines = [
+      `${site.name} · ${label}`,
+      `Visitors: ${fmtNumber(c.visitors)} (${fmtNumber(c.newVisitors)} new / ${fmtNumber(c.returningVisitors)} returning)`,
+      `Revenue: ${money(c.revenue)} · Conversion: ${fmtPct(c.conversionRate, 1)}`,
+    ];
+    if (revPct !== null) lines.push(`Revenue vs prior: ${revPct >= 0 ? '+' : ''}${revPct}%`);
+    if (cards.length) {
+      lines.push('', 'Insights:');
+      for (const card of cards.slice(0, 5)) lines.push(`• ${card.title}${card.detail ? ` — ${card.detail}` : ''}`);
+    }
+    await navigator.clipboard.writeText(lines.join('\n'));
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }
 
   function shift(dir: -1 | 1) {
     if (!overview) return;
@@ -115,42 +159,50 @@ export function Toolbar({
 
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <BackButton to="/" label="" className="btn h-11 w-11 justify-center px-0" />
-      <Dropdown
-        button={
-          <button className="btn h-11 px-4 text-base">
-            <Favicon domain={site.domain} size={22} />
-            <span className="max-w-[180px] truncate font-semibold">{site.name}</span>
-            <Chevron />
-          </button>
-        }
-      >
-        {(close) => (
-          <>
-            {sites.map((s) => (
-              <button
-                key={s.id}
-                className={itemCls(s.id === site.id)}
-                onClick={() => {
-                  close();
-                  // Switching sites replaces the history entry, so the browser's back button returns to the
-                  // all-websites page rather than stepping through every site viewed.
-                  navigate(`/site/${s.id}${window.location.search}`, { replace: true });
-                }}
-              >
-                <Favicon domain={s.domain} size={16} /> {s.name}
+      {!hideSiteSwitcher && <BackButton to="/" label="" className="btn h-11 w-11 justify-center px-0" />}
+      {hideSiteSwitcher ? (
+        <div className="btn h-11 cursor-default px-4 text-base">
+          <Favicon domain={site.domain} size={22} />
+          <span className="max-w-[180px] truncate font-semibold">{site.name}</span>
+          {readOnly && <span className="rounded-md bg-stone-100 px-1.5 py-0.5 text-xs font-medium text-stone-500">Shared</span>}
+        </div>
+      ) : (
+        <Dropdown
+          button={
+            <button className="btn h-11 px-4 text-base">
+              <Favicon domain={site.domain} size={22} />
+              <span className="max-w-[180px] truncate font-semibold">{site.name}</span>
+              <Chevron />
+            </button>
+          }
+        >
+          {(close) => (
+            <>
+              {sites.map((s) => (
+                <button
+                  key={s.id}
+                  className={itemCls(s.id === site.id)}
+                  onClick={() => {
+                    close();
+                    // Switching sites replaces the history entry, so the browser's back button returns to the
+                    // all-websites page rather than stepping through every site viewed.
+                    navigate(`/site/${s.id}${window.location.search}`, { replace: true });
+                  }}
+                >
+                  <Favicon domain={s.domain} size={16} /> {s.name}
+                </button>
+              ))}
+              <div className="my-1 border-t border-stone-100" />
+              <button className={itemCls(false)} onClick={() => navigate(`/site/${site.id}/settings`)}>
+                ⚙️ Site settings & install
               </button>
-            ))}
-            <div className="my-1 border-t border-stone-100" />
-            <button className={itemCls(false)} onClick={() => navigate(`/site/${site.id}/settings`)}>
-              ⚙️ Site settings & install
-            </button>
-            <button className={itemCls(false)} onClick={() => navigate('/')}>
-              ＋ All websites
-            </button>
-          </>
-        )}
-      </Dropdown>
+              <button className={itemCls(false)} onClick={() => navigate('/')}>
+                ＋ All websites
+              </button>
+            </>
+          )}
+        </Dropdown>
+      )}
 
       <div className="flex h-11 items-stretch rounded-xl border border-stone-200 bg-white shadow-card">
         <button className="rounded-l-xl px-3 text-xl text-stone-500 hover:bg-stone-50" onClick={() => shift(-1)} aria-label="Previous period">
@@ -231,6 +283,68 @@ export function Toolbar({
       <button className="btn h-11 px-4 text-base" onClick={onLive} title="Live map (M)">
         <span className="h-2 w-2 animate-pulse rounded-full bg-green-500" /> Live
       </button>
+
+      {!readOnly && (
+        <Dropdown
+          align="right"
+          button={
+            <button className="btn h-11 px-4 text-base">
+              Export <Chevron />
+            </button>
+          }
+        >
+          {(close) => (
+            <>
+              <button
+                className={itemCls(false)}
+                onClick={() => {
+                  close();
+                  downloadCsv('overview').catch(() => {});
+                }}
+              >
+                Overview CSV
+              </button>
+              <button
+                className={itemCls(false)}
+                onClick={() => {
+                  close();
+                  downloadCsv('breakdown', 'source').catch(() => {});
+                }}
+              >
+                Referrers CSV
+              </button>
+              <button
+                className={itemCls(false)}
+                onClick={() => {
+                  close();
+                  downloadCsv('breakdown', 'product').catch(() => {});
+                }}
+              >
+                Products CSV
+              </button>
+              <button
+                className={itemCls(false)}
+                onClick={() => {
+                  close();
+                  downloadCsv('customers').catch(() => {});
+                }}
+              >
+                Customers CSV
+              </button>
+              <div className="my-1 border-t border-stone-100" />
+              <button
+                className={itemCls(false)}
+                onClick={() => {
+                  close();
+                  copySummary().catch(() => {});
+                }}
+              >
+                {copied ? '✓ Copied summary' : 'Copy period summary'}
+              </button>
+            </>
+          )}
+        </Dropdown>
+      )}
 
       <button className="btn h-11 w-11 px-0" onClick={onRefresh} aria-label="Refresh">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={loading ? 'animate-spin' : ''}>

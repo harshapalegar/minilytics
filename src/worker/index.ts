@@ -7,7 +7,21 @@ import { billingWebhook, checkout, planInfo } from './billing';
 import { passwordsMatch, randomId } from './lib/crypto';
 import { handleDodoWebhook, handleGoalApi, handlePaymentApi, handleStripeWebhook, learnDodoProducts, rematchPayments } from './payments';
 import { rememberOwnerDevice } from './owner';
-import { breakdown, customers, funnel, makeCtx, overview, realtime, sparklines, visitorProfile, visitors, type FunnelStep } from './stats';
+import {
+  breakdown,
+  customers,
+  exportCsv,
+  funnel,
+  insights,
+  makeCtx,
+  makeCtxFrom,
+  overview,
+  realtime,
+  sparklines,
+  visitorProfile,
+  visitors,
+  type FunnelStep,
+} from './stats';
 
 const app = new Hono<AppEnv>();
 const MAX_FAILURES = 10;
@@ -88,6 +102,105 @@ app.get('/api/public/plan', async (c) => c.json(await planInfo(c.env)));
 app.post('/api/billing/webhook', billingWebhook);
 app.get('/api/billing/checkout', requireUser, checkout);
 
+// ---------- public read-only share links
+
+async function loadShare(c: Context<AppEnv>): Promise<{ site: Site; token: string } | Response> {
+  const token = c.req.param('token');
+  if (!token || token.length < 16) return c.json({ error: 'not found' }, 404);
+  const row = await c.env.DB.prepare(
+    `SELECT s.*, sl.token, sl.expires_at, sl.label AS share_label
+     FROM share_links sl JOIN sites s ON s.id = sl.site_id
+     WHERE sl.token = ?`,
+  )
+    .bind(token)
+    .first<Site & { token: string; expires_at: number | null; share_label: string | null }>();
+  if (!row) return c.json({ error: 'not found' }, 404);
+  if (row.expires_at != null && row.expires_at < Date.now()) return c.json({ error: 'This share link has expired' }, 410);
+  const { token: _t, expires_at: _e, share_label: _l, ...site } = row;
+  return { site: site as Site, token };
+}
+
+app.get('/api/share/:token', async (c) => {
+  const loaded = await loadShare(c);
+  if (loaded instanceof Response) return loaded;
+  return c.json({
+    site: {
+      id: loaded.site.id,
+      name: loaded.site.name,
+      domain: loaded.site.domain,
+      timezone: loaded.site.timezone,
+      currency: loaded.site.currency,
+      created_at: loaded.site.created_at,
+    },
+    readOnly: true,
+  });
+});
+
+app.get('/api/share/:token/overview', async (c) => {
+  const loaded = await loadShare(c);
+  if (loaded instanceof Response) return loaded;
+  return c.json(await overview(makeCtxFrom(c.env.DB, loaded.site, c.req.query())));
+});
+
+app.get('/api/share/:token/insights', async (c) => {
+  const loaded = await loadShare(c);
+  if (loaded instanceof Response) return loaded;
+  return c.json(await insights(makeCtxFrom(c.env.DB, loaded.site, c.req.query())));
+});
+
+app.get('/api/share/:token/breakdown', async (c) => {
+  const loaded = await loadShare(c);
+  if (loaded instanceof Response) return loaded;
+  try {
+    return c.json(
+      await breakdown(makeCtxFrom(c.env.DB, loaded.site, c.req.query()), c.req.query('dim') ?? 'source', Number(c.req.query('limit')) || 100),
+    );
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+});
+
+app.get('/api/share/:token/customers', async (c) => {
+  const loaded = await loadShare(c);
+  if (loaded instanceof Response) return loaded;
+  return c.json(await customers(makeCtxFrom(c.env.DB, loaded.site, c.req.query())));
+});
+
+app.get('/api/share/:token/visitors', async (c) => {
+  const loaded = await loadShare(c);
+  if (loaded instanceof Response) return loaded;
+  return c.json(await visitors(makeCtxFrom(c.env.DB, loaded.site, c.req.query())));
+});
+
+app.get('/api/share/:token/visitors/:vid', async (c) => {
+  const loaded = await loadShare(c);
+  if (loaded instanceof Response) return loaded;
+  return c.json(await visitorProfile(c.env.DB, loaded.site, c.req.param('vid')));
+});
+
+app.get('/api/share/:token/realtime', async (c) => {
+  const loaded = await loadShare(c);
+  if (loaded instanceof Response) return loaded;
+  return c.json(await realtime(c.env.DB, loaded.site));
+});
+
+app.get('/api/share/:token/funnels', async (c) => {
+  const loaded = await loadShare(c);
+  if (loaded instanceof Response) return loaded;
+  const res = await c.env.DB.prepare('SELECT * FROM funnels WHERE site_id = ? ORDER BY created_at').bind(loaded.site.id).all();
+  return c.json(res.results.map((f: any) => ({ ...f, steps: JSON.parse(f.steps) })));
+});
+
+app.get('/api/share/:token/funnels/:fid/stats', async (c) => {
+  const loaded = await loadShare(c);
+  if (loaded instanceof Response) return loaded;
+  const f = await c.env.DB.prepare('SELECT * FROM funnels WHERE id = ? AND site_id = ?')
+    .bind(c.req.param('fid'), loaded.site.id)
+    .first<{ steps: string }>();
+  if (!f) return c.json({ error: 'funnel not found' }, 404);
+  return c.json(await funnel(makeCtxFrom(c.env.DB, loaded.site, c.req.query()), JSON.parse(f.steps)));
+});
+
 // ---------- dashboard API (login required)
 
 app.use('/api/sites', requireUser);
@@ -152,7 +265,17 @@ app.use('/api/sites-overview', requireUser);
 app.get('/api/sites-overview', async (c) => {
   const access = siteAccessSql(c.env, c.get('user'));
   const rows = await c.env.DB.prepare(`SELECT s.id FROM sites s WHERE ${access.sql}`).bind(...access.params).all<{ id: string }>();
-  return c.json(await sparklines(c.env.DB, rows.results.map((r) => r.id), c.req.query('period') ?? '30d'));
+  const sites = await sparklines(
+    c.env.DB,
+    rows.results.map((r) => r.id),
+    c.req.query('period') ?? '30d',
+  );
+  const totals = {
+    visitors: sites.reduce((a, s) => a + s.visitors, 0),
+    revenue: sites.reduce((a, s) => a + s.revenue, 0),
+    online: sites.reduce((a, s) => a + s.online, 0),
+  };
+  return c.json({ sites, totals });
 });
 
 app.post('/api/sites', async (c) => {
@@ -236,9 +359,9 @@ app.delete('/api/sites/:id', async (c) => {
   const id = c.get('site').id;
   await c.env.DB.batch(
     // Everything stored for the site, so deleting it really removes its visitors' data.
-    ['events', 'sessions', 'visitors', 'payments', 'funnels', 'payment_claims', 'pending_payments', 'dodo_products'].map((t) =>
-      c.env.DB.prepare(`DELETE FROM ${t} WHERE site_id = ?`).bind(id),
-    ).concat(c.env.DB.prepare('DELETE FROM sites WHERE id = ?').bind(id)),
+    ['events', 'sessions', 'visitors', 'payments', 'funnels', 'payment_claims', 'pending_payments', 'dodo_products', 'share_links']
+      .map((t) => c.env.DB.prepare(`DELETE FROM ${t} WHERE site_id = ?`).bind(id))
+      .concat(c.env.DB.prepare('DELETE FROM sites WHERE id = ?').bind(id)),
   );
   forgetSite(id);
   return c.json({ ok: true });
@@ -247,6 +370,7 @@ app.delete('/api/sites/:id', async (c) => {
 // ---------- stats
 
 app.get('/api/sites/:id/overview', async (c) => c.json(await overview(makeCtx(c))));
+app.get('/api/sites/:id/insights', async (c) => c.json(await insights(makeCtx(c))));
 
 app.get('/api/sites/:id/breakdown', async (c) => {
   try {
@@ -254,6 +378,51 @@ app.get('/api/sites/:id/breakdown', async (c) => {
   } catch (e) {
     return c.json({ error: (e as Error).message }, 400);
   }
+});
+
+app.get('/api/sites/:id/export.csv', async (c) => {
+  try {
+    const kind = c.req.query('kind') ?? 'overview';
+    const { filename, body } = await exportCsv(makeCtx(c), kind, c.req.query('dim') ?? 'source');
+    return new Response(body, {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Cache-Control': 'no-store',
+      },
+    });
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+});
+
+app.get('/api/sites/:id/share-links', async (c) => {
+  const rows = await c.env.DB.prepare(
+    'SELECT token, label, created_at, expires_at FROM share_links WHERE site_id = ? ORDER BY created_at DESC',
+  )
+    .bind(c.get('site').id)
+    .all();
+  return c.json(rows.results);
+});
+
+app.post('/api/sites/:id/share-links', async (c) => {
+  const b = await c.req.json<{ label?: string; days?: number }>().catch(() => ({}) as { label?: string; days?: number });
+  const token = randomId(24);
+  const now = Date.now();
+  const days = Number.isFinite(b.days) ? Math.max(1, Math.min(365, Number(b.days))) : 30;
+  const expires_at = now + days * 86_400_000;
+  const label = (b.label ?? 'Read-only link').trim().slice(0, 80) || 'Read-only link';
+  await c.env.DB.prepare('INSERT INTO share_links (token, site_id, label, created_at, expires_at) VALUES (?, ?, ?, ?, ?)')
+    .bind(token, c.get('site').id, label, now, expires_at)
+    .run();
+  return c.json({ token, label, created_at: now, expires_at });
+});
+
+app.delete('/api/sites/:id/share-links/:token', async (c) => {
+  await c.env.DB.prepare('DELETE FROM share_links WHERE token = ? AND site_id = ?')
+    .bind(c.req.param('token'), c.get('site').id)
+    .run();
+  return c.json({ ok: true });
 });
 
 // Dodo payments that couldn't be placed on a site yet, grouped by product.
@@ -316,7 +485,7 @@ app.all('/api/*', (c) => c.json({ error: 'not found' }, 404));
 
 // Static files are served before the Worker runs. What reaches here is a client-side route, or a page that doesn't exist.
 const PUBLIC_PAGES = /^\/(terms|privacy|refund)\/?$/;
-const APP_PAGES = /^\/(billing(\/.*)?|site\/[\w-]+(\/settings)?\/?)$/;
+const APP_PAGES = /^\/(billing(\/.*)?|site\/[\w-]+(\/settings)?\/?|share\/[\w-]+\/?)$/;
 
 app.all('*', async (c) => {
   const path = new URL(c.req.url).pathname;

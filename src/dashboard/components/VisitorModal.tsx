@@ -13,9 +13,9 @@ interface Profile {
 }
 
 export function VisitorModal({ visitorId, onClose }: { visitorId: string | null; onClose: () => void }) {
-  const { site, money } = useDash();
+  const { site, money, apiPrefix } = useDash();
   // The parent remounts this per visitor (key), so `data` always belongs to `visitorId`.
-  const { data: p } = useApi<Profile>(visitorId ? `/api/sites/${site.id}/visitors/${visitorId}` : null);
+  const { data: p } = useApi<Profile>(visitorId ? `${apiPrefix}/visitors/${visitorId}` : null);
   const last = p?.sessions[0];
   const firstSession = p?.sessions[p.sessions.length - 1];
   const paid = p?.payments.reduce((a, x) => a + x.amount, 0) ?? 0;

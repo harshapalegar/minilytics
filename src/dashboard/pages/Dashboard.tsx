@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { navigate } from '../App';
 import { GoalsPanel } from '../components/GoalsPanel';
+import { InsightsStrip } from '../components/InsightsStrip';
 import { OverviewCard } from '../components/OverviewCard';
 import { Panel, renderLabel } from '../components/Panel';
 import { Toolbar } from '../components/Toolbar';
@@ -32,6 +33,7 @@ const FILTER_LABELS: Record<string, { label: string; dim: string }> = {
   entry_page: { label: 'Entry page', dim: 'entry_page' },
   hostname: { label: 'Hostname', dim: 'hostname' },
   goal: { label: 'Completed goal', dim: 'goal' },
+  product: { label: 'Product', dim: 'product' },
 };
 
 export function Dashboard({ siteId }: { siteId: string }) {
@@ -51,7 +53,8 @@ export function Dashboard({ siteId }: { siteId: string }) {
   }, []);
   const { data: sites } = useApi<Site[]>('/api/sites');
   const site = sites?.find((s) => s.id === siteId);
-  const { data: overview, loading } = useApi<Overview>(site ? `/api/sites/${siteId}/overview?${qs(q)}` : null, reloadKey);
+  const apiPrefix = `/api/sites/${siteId}`;
+  const { data: overview, loading } = useApi<Overview>(site ? `${apiPrefix}/overview?${qs(q)}` : null, reloadKey);
 
   const addFilter = useCallback((key: string, value: string) => update({ filters: { ...q.filters, [key]: value } }), [q.filters, update]);
   const removeFilter = (key: string) => {
@@ -70,8 +73,9 @@ export function Dashboard({ siteId }: { siteId: string }) {
       money: (minor, compact) => fmtMoney(minor, site.currency, decimals, compact),
       addFilter,
       openVisitor: setVisitor,
+      apiPrefix,
     };
-  }, [site, q, reloadKey, overview?.decimals, addFilter]);
+  }, [site, q, reloadKey, overview?.decimals, addFilter, apiPrefix]);
 
   if (sites && !site) {
     return (
@@ -97,6 +101,7 @@ export function Dashboard({ siteId }: { siteId: string }) {
           onRefresh={() => setReloadKey((k) => k + 1)}
           onLive={() => setLive(true)}
           loading={loading}
+          apiPrefix={apiPrefix}
         />
 
         {Object.keys(q.filters).length > 0 && (
@@ -120,6 +125,8 @@ export function Dashboard({ siteId }: { siteId: string }) {
           <OverviewCard data={overview} onLive={() => setLive(true)} />
         </div>
 
+        <InsightsStrip />
+
         <div className="mt-5 grid gap-5 lg:grid-cols-2">
           <Panel
             tabs={[
@@ -127,6 +134,7 @@ export function Dashboard({ siteId }: { siteId: string }) {
               { label: 'Referrer', dim: 'source', filter: 'source' },
               { label: 'Campaign', dim: 'campaign', filter: 'utm_campaign' },
               { label: 'Keyword', dim: 'keyword', filter: 'utm_term' },
+              { label: 'Product', dim: 'product', filter: 'product' },
             ]}
           />
           <Panel

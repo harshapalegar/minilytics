@@ -6,6 +6,7 @@ import { Landing } from './pages/Landing';
 import { Legal } from './pages/Legal';
 import { Login } from './pages/Login';
 import { Settings } from './pages/Settings';
+import { Share } from './pages/Share';
 import { Sites } from './pages/Sites';
 
 export function navigate(to: string, { replace = false }: { replace?: boolean } = {}) {
@@ -35,7 +36,8 @@ const LEGAL_META = {
   refund: { title: 'Refund Policy | Minilytics', description: 'How refunds work for Minilytics, including the 14-day money-back guarantee.' },
 };
 const LEGAL = /^\/(terms|privacy|refund)\/?$/;
-const APP_PAGE = /^\/(billing(\/.*)?|site\/[\w-]+(\/settings)?\/?)$/;
+const SHARE_PAGE = /^\/share\/([\w-]+)\/?$/;
+const APP_PAGE = /^\/(billing(\/.*)?|site\/[\w-]+(\/settings)?\/?|share\/[\w-]+\/?)$/;
 
 function setTag(selector: string, create: () => HTMLElement, attr: string, value: string) {
   let el = document.head.querySelector<HTMLElement>(selector);
@@ -116,6 +118,15 @@ export function App() {
 
   const legal = LEGAL.exec(path);
   if (legal) return <Legal page={legal[1] as 'terms' | 'privacy' | 'refund'} />;
+
+  const share = SHARE_PAGE.exec(path);
+  if (share) {
+    return (
+      <MeContext.Provider value={{ me, refresh }}>
+        <Share token={share[1]} />
+      </MeContext.Provider>
+    );
+  }
 
   if (path !== '/' && !APP_PAGE.test(path)) return <NotFound />;
 

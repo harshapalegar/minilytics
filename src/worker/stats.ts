@@ -25,14 +25,14 @@ const SESSION_FILTERS = [
   'hostname',
 ] as const;
 
-export type Filters = Partial<Record<(typeof SESSION_FILTERS)[number] | 'page' | 'goal', string>>;
+export type Filters = Partial<Record<(typeof SESSION_FILTERS)[number] | 'page' | 'goal' | 'product', string>>;
 
 export function parseFilters(raw: string | undefined): Filters {
   if (!raw) return {};
   try {
     const obj = JSON.parse(raw);
     const out: Filters = {};
-    for (const k of [...SESSION_FILTERS, 'page', 'goal'] as const) {
+    for (const k of [...SESSION_FILTERS, 'page', 'goal', 'product'] as const) {
       if (typeof obj[k] === 'string') out[k] = obj[k].slice(0, 500);
     }
     return out;
@@ -62,6 +62,14 @@ function filterSql(f: Filters): { sql: string; params: unknown[] } {
     parts.push(`EXISTS (SELECT 1 FROM events fe WHERE fe.site_id = s.site_id AND fe.session_id = s.id AND fe.type = 'goal' AND fe.name = ?)`);
     params.push(f.goal);
   }
+  if (f.product !== undefined) {
+    if (f.product === '') {
+      parts.push(`EXISTS (SELECT 1 FROM payments fp WHERE fp.site_id = s.site_id AND fp.session_id = s.id AND fp.product_id IS NULL)`);
+    } else {
+      parts.push(`EXISTS (SELECT 1 FROM payments fp WHERE fp.site_id = s.site_id AND fp.session_id = s.id AND fp.product_id = ?)`);
+      params.push(f.product);
+    }
+  }
   return { sql: parts.length ? ' AND ' + parts.join(' AND ') : '', params };
 }
 
@@ -75,11 +83,13 @@ interface Ctx {
   offset: number;
 }
 
-export function makeCtx(c: Context<AppEnv>): Ctx {
-  const site = c.get('site');
-  const q = c.req.query();
+export function makeCtxFrom(db: D1Database, site: Site, q: Record<string, string | undefined>): Ctx {
   const range = resolveRange(q, site.timezone, site.created_at);
-  return { db: c.env.DB, site, range, filters: parseFilters(q.filters), offset: tzOffset(site.timezone, range.to) };
+  return { db, site, range, filters: parseFilters(q.filters), offset: tzOffset(site.timezone, range.to) };
+}
+
+export function makeCtx(c: Context<AppEnv>): Ctx {
+  return makeCtxFrom(c.env.DB, c.get('site'), c.req.query());
 }
 
 function sessionsWhere(ctx: Ctx, from = ctx.range.from, to = ctx.range.to) {
@@ -90,16 +100,31 @@ function sessionsWhere(ctx: Ctx, from = ctx.range.from, to = ctx.range.to) {
   };
 }
 
-/** Payments in the period; with filters, only those credited to a matching visit. */
+/** Extra payment-column filters (product lives on payments, not sessions). */
+function paymentFilterSql(f: Filters): { sql: string; params: unknown[] } {
+  if (f.product === undefined) return { sql: '', params: [] };
+  if (f.product === '') return { sql: ' AND p.product_id IS NULL', params: [] };
+  return { sql: ' AND p.product_id = ?', params: [f.product] };
+}
+
+/** Session-side filters only (product lives on payments). */
+function sessionFiltersOnly(f: Filters): Filters {
+  const { product: _p, ...rest } = f;
+  return rest;
+}
+
+/** Payments in the period; with session filters, only those credited to a matching visit. */
 function paymentsFrom(ctx: Ctx, from = ctx.range.from, to = ctx.range.to) {
-  if (!hasFilters(ctx.filters)) {
-    return { sql: `payments p WHERE p.site_id = ? AND p.ts >= ? AND p.ts < ?`, params: [ctx.site.id, from, to] };
+  const pf = paymentFilterSql(ctx.filters);
+  const sf = sessionFiltersOnly(ctx.filters);
+  if (!hasFilters(sf)) {
+    return { sql: `payments p WHERE p.site_id = ? AND p.ts >= ? AND p.ts < ?${pf.sql}`, params: [ctx.site.id, from, to, ...pf.params] };
   }
-  const f = filterSql(ctx.filters);
+  const f = filterSql(sf);
   return {
     sql: `payments p JOIN sessions s ON s.site_id = p.site_id AND s.id = p.session_id
-          WHERE p.site_id = ? AND p.ts >= ? AND p.ts < ?${f.sql}`,
-    params: [ctx.site.id, from, to, ...f.params],
+          WHERE p.site_id = ? AND p.ts >= ? AND p.ts < ?${f.sql}${pf.sql}`,
+    params: [ctx.site.id, from, to, ...f.params, ...pf.params],
   };
 }
 
@@ -128,7 +153,7 @@ interface RevRow {
   payments: number;
 }
 
-function kpis(k: KpiRow, r: RevRow) {
+function kpis(k: KpiRow, r: RevRow, retention?: { newVisitors: number; returningVisitors: number }) {
   return {
     visitors: k.visitors,
     sessions: k.sessions,
@@ -140,13 +165,16 @@ function kpis(k: KpiRow, r: RevRow) {
     customers: r.customers,
     conversionRate: k.visitors ? r.customers / k.visitors : 0,
     revenuePerVisitor: k.visitors ? r.revenue / k.visitors : 0,
+    newVisitors: retention?.newVisitors ?? 0,
+    returningVisitors: retention?.returningVisitors ?? 0,
   };
 }
 
-/** Top numbers + chart. */
+/** Top numbers + chart (includes previous-period overlay series and new/returning split). */
 export async function overview(ctx: Ctx) {
   const { db, range, site } = ctx;
-  const prevFrom = range.from - (range.to - range.from);
+  const span = range.to - range.from;
+  const prevFrom = range.from - span;
   const cur = sessionsWhere(ctx);
   const prev = sessionsWhere(ctx, prevFrom, range.from);
   const curPay = paymentsFrom(ctx);
@@ -154,8 +182,9 @@ export async function overview(ctx: Ctx) {
   const sb = bucketSql('s.started_at', range.granularity, ctx.offset);
   const pb = bucketSql('p.ts', range.granularity, ctx.offset);
   const now = Date.now();
+  const prevRange: Range = { from: prevFrom, to: range.from, granularity: range.granularity };
 
-  const [k1, k0, r1, r0, online, ts, tr] = await db.batch([
+  const [k1, k0, r1, r0, online, ts, tr, pts, ptr, ret1, ret0] = await db.batch([
     db.prepare(KPI_SQL(cur.sql)).bind(...cur.params),
     db.prepare(KPI_SQL(prev.sql)).bind(...prev.params),
     db.prepare(REVENUE_SQL(curPay.sql)).bind(...curPay.params),
@@ -175,25 +204,67 @@ export async function overview(ctx: Ctx) {
          FROM ${curPay.sql} GROUP BY b`,
       )
       .bind(...curPay.params),
+    db
+      .prepare(
+        `SELECT ${sb} AS b, COUNT(DISTINCT s.visitor_id) AS visitors
+         FROM sessions s WHERE ${prev.sql} GROUP BY b`,
+      )
+      .bind(...prev.params),
+    db
+      .prepare(
+        `SELECT ${pb} AS b, SUM(p.amount) AS revenue
+         FROM ${prevPay.sql} GROUP BY b`,
+      )
+      .bind(...prevPay.params),
+    db
+      .prepare(
+        `SELECT COUNT(DISTINCT CASE WHEN v.first_seen >= ? AND v.first_seen < ? THEN s.visitor_id END) AS new_visitors,
+                COUNT(DISTINCT CASE WHEN v.first_seen < ? THEN s.visitor_id END) AS returning_visitors
+         FROM sessions s JOIN visitors v ON v.site_id = s.site_id AND v.id = s.visitor_id
+         WHERE ${cur.sql}`,
+      )
+      .bind(range.from, range.to, range.from, ...cur.params),
+    db
+      .prepare(
+        `SELECT COUNT(DISTINCT CASE WHEN v.first_seen >= ? AND v.first_seen < ? THEN s.visitor_id END) AS new_visitors,
+                COUNT(DISTINCT CASE WHEN v.first_seen < ? THEN s.visitor_id END) AS returning_visitors
+         FROM sessions s JOIN visitors v ON v.site_id = s.site_id AND v.id = s.visitor_id
+         WHERE ${prev.sql}`,
+      )
+      .bind(prevFrom, range.from, prevFrom, ...prev.params),
   ]);
 
   const visitorsBy = new Map((ts.results as any[]).map((r) => [r.b, r]));
   const revenueBy = new Map((tr.results as any[]).map((r) => [r.b, r]));
+  const prevVisitorsBy = new Map((pts.results as any[]).map((r) => [r.b, r.visitors as number]));
+  const prevRevenueBy = new Map((ptr.results as any[]).map((r) => [r.b, r.revenue as number]));
   const labels = bucketLabels(range, ctx.offset);
-  const series = labels.map((b) => ({
+  const prevLabels = bucketLabels(prevRange, ctx.offset);
+  const series = labels.map((b, i) => ({
     bucket: b,
     visitors: visitorsBy.get(b)?.visitors ?? 0,
     pageviews: visitorsBy.get(b)?.pageviews ?? 0,
     revenue: revenueBy.get(b)?.revenue ?? 0,
     payments: revenueBy.get(b)?.payments ?? 0,
+    visitors_prev: prevVisitorsBy.get(prevLabels[i] ?? '') ?? 0,
+    revenue_prev: prevRevenueBy.get(prevLabels[i] ?? '') ?? 0,
   }));
+
+  const curRet = (ret1.results[0] as { new_visitors: number; returning_visitors: number }) ?? { new_visitors: 0, returning_visitors: 0 };
+  const prevRet = (ret0.results[0] as { new_visitors: number; returning_visitors: number }) ?? { new_visitors: 0, returning_visitors: 0 };
 
   return {
     range,
     currency: site.currency,
     decimals: currencyDecimals(site.currency),
-    current: kpis(k1.results[0] as KpiRow, r1.results[0] as RevRow),
-    previous: kpis(k0.results[0] as KpiRow, r0.results[0] as RevRow),
+    current: kpis(k1.results[0] as KpiRow, r1.results[0] as RevRow, {
+      newVisitors: curRet.new_visitors,
+      returningVisitors: curRet.returning_visitors,
+    }),
+    previous: kpis(k0.results[0] as KpiRow, r0.results[0] as RevRow, {
+      newVisitors: prevRet.new_visitors,
+      returningVisitors: prevRet.returning_visitors,
+    }),
     online: (online.results[0] as { n: number }).n,
     series,
   };
@@ -238,14 +309,12 @@ export async function breakdown(ctx: Ctx, dim: string, limit = 100): Promise<Bre
   if (SESSION_DIMS[dim]) {
     const col = SESSION_DIMS[dim];
     const w = sessionsWhere(ctx);
-    const pay = paymentsFrom(ctx);
-    // Payments need the session columns even without filters.
-    const payJoin = hasFilters(ctx.filters)
-      ? pay
-      : {
-          sql: `payments p JOIN sessions s ON s.site_id = p.site_id AND s.id = p.session_id WHERE p.site_id = ? AND p.ts >= ? AND p.ts < ?`,
-          params: pay.params,
-        };
+    // Revenue always joins sessions so we can group by session dimensions; product filter stays on payments.
+    const sf = filterSql(sessionFiltersOnly(ctx.filters));
+    const pf = paymentFilterSql(ctx.filters);
+    const payParams = [ctx.site.id, ctx.range.from, ctx.range.to, ...sf.params, ...pf.params];
+    const payJoin = `payments p JOIN sessions s ON s.site_id = p.site_id AND s.id = p.session_id
+                     WHERE p.site_id = ? AND p.ts >= ? AND p.ts < ?${sf.sql}${pf.sql}`;
     const extraCol =
       dim === 'source' ? 'MAX(s.referrer_domain)' : dim === 'region' || dim === 'city' ? 'MAX(s.country)' : 'NULL';
     const [v, r] = await db.batch([
@@ -259,9 +328,9 @@ export async function breakdown(ctx: Ctx, dim: string, limit = 100): Promise<Bre
         .prepare(
           `SELECT ${col} AS label, SUM(p.amount) AS revenue,
                   COUNT(DISTINCT CASE WHEN p.kind = 'payment' THEN COALESCE(p.visitor_id, p.id) END) AS customers
-           FROM ${payJoin.sql} GROUP BY label`,
+           FROM ${payJoin} GROUP BY label`,
         )
-        .bind(...payJoin.params),
+        .bind(...payParams),
     ]);
     return merge(v.results as any[], r.results as any[]);
   }
@@ -314,6 +383,27 @@ export async function breakdown(ctx: Ctx, dim: string, limit = 100): Promise<Bre
         .bind(...params, ctx.site.id, ctx.range.from, ctx.range.to),
     ]);
     return merge(v.results as any[], r.results as any[]);
+  }
+
+  if (dim === 'product') {
+    const pay = paymentsFrom(ctx);
+    const r = await db
+      .prepare(
+        `SELECT p.product_id AS label, SUM(p.amount) AS revenue,
+                COUNT(DISTINCT CASE WHEN p.kind = 'payment' THEN COALESCE(p.visitor_id, p.id) END) AS customers,
+                COUNT(DISTINCT p.visitor_id) AS visitors
+         FROM ${pay.sql}
+         GROUP BY p.product_id
+         ORDER BY revenue DESC LIMIT ${lim}`,
+      )
+      .bind(...pay.params)
+      .all();
+    return (r.results as any[]).map((row) => ({
+      label: row.label,
+      visitors: row.visitors ?? 0,
+      revenue: row.revenue ?? 0,
+      customers: row.customers ?? 0,
+    }));
   }
 
   throw new Error(`unknown dimension ${dim}`);
@@ -578,4 +668,247 @@ export async function sparklines(db: D1Database, siteIds: string[], period: stri
   for (const row of vs.results as any[]) out.get(row.site_id)!.series[row.b].visitors = row.v;
   for (const row of rs.results as any[]) out.get(row.site_id)!.series[row.b].revenue = row.r;
   return [...out.values()];
+}
+
+export interface Insight {
+  id: string;
+  kind: 'kpi' | 'share' | 'mover';
+  title: string;
+  detail: string;
+  sentiment: 'up' | 'down' | 'neutral';
+  filter?: { key: string; value: string };
+  score: number;
+}
+
+function pctChange(cur: number, prev: number): number | null {
+  if (!prev) return cur ? 1 : null;
+  return (cur - prev) / prev;
+}
+
+function fmtSignedPct(n: number): string {
+  const pct = Math.round(Math.abs(n) * 100);
+  return `${n >= 0 ? '+' : '−'}${pct}%`;
+}
+
+const INSIGHT_DIMS: { dim: string; filter: string; noun: string }[] = [
+  { dim: 'source', filter: 'source', noun: 'referrer' },
+  { dim: 'channel', filter: 'channel', noun: 'channel' },
+  { dim: 'campaign', filter: 'utm_campaign', noun: 'campaign' },
+  { dim: 'country', filter: 'country', noun: 'country' },
+  { dim: 'product', filter: 'product', noun: 'product' },
+];
+
+/** Pure ranking helper — exported for unit tests. */
+export function rankInsights(input: {
+  current: ReturnType<typeof kpis>;
+  previous: ReturnType<typeof kpis>;
+  movers: { dim: string; filter: string; noun: string; label: string | null; revenue: number; prevRevenue: number; visitors: number }[];
+}): Insight[] {
+  const cards: Insight[] = [];
+  const { current: c, previous: p } = input;
+
+  const revPct = pctChange(c.revenue, p.revenue);
+  if (revPct !== null && (Math.abs(revPct) >= 0.05 || c.revenue > 0)) {
+    cards.push({
+      id: 'kpi-revenue',
+      kind: 'kpi',
+      title: `Revenue ${fmtSignedPct(revPct)} vs prior period`,
+      detail: p.revenue ? `Compared with the previous window of the same length.` : `No revenue in the prior period.`,
+      sentiment: revPct >= 0 ? 'up' : 'down',
+      score: Math.abs(revPct) * 100 + (c.revenue > 0 ? 10 : 0),
+    });
+  }
+
+  const visPct = pctChange(c.visitors, p.visitors);
+  if (visPct !== null && Math.abs(visPct) >= 0.08) {
+    cards.push({
+      id: 'kpi-visitors',
+      kind: 'kpi',
+      title: `Visitors ${fmtSignedPct(visPct)}`,
+      detail: `${c.newVisitors} new · ${c.returningVisitors} returning`,
+      sentiment: visPct >= 0 ? 'up' : 'down',
+      score: Math.abs(visPct) * 80,
+    });
+  }
+
+  const convDelta = c.conversionRate - p.conversionRate;
+  if (p.visitors >= 20 && Math.abs(convDelta) >= 0.005) {
+    const pp = (convDelta * 100).toFixed(1);
+    cards.push({
+      id: 'kpi-conversion',
+      kind: 'kpi',
+      title: `Conversion ${convDelta >= 0 ? '+' : ''}${pp}pp`,
+      detail: `${(c.conversionRate * 100).toFixed(1)}% of visitors became customers`,
+      sentiment: convDelta >= 0 ? 'up' : 'down',
+      score: Math.abs(convDelta) * 2000,
+    });
+  }
+
+  for (const m of input.movers) {
+    const label = m.label || (m.dim === 'product' ? 'Unknown product' : 'Direct/None');
+    if (c.revenue > 0 && m.revenue > 0) {
+      const share = m.revenue / c.revenue;
+      if (share >= 0.2) {
+        cards.push({
+          id: `share-${m.dim}-${label}`,
+          kind: 'share',
+          title: `${label} drove ${Math.round(share * 100)}% of revenue`,
+          detail: `Top ${m.noun} this period`,
+          sentiment: 'neutral',
+          filter: { key: m.filter, value: m.label ?? '' },
+          score: share * 90,
+        });
+      }
+    }
+    const move = pctChange(m.revenue, m.prevRevenue);
+    if (move !== null && Math.abs(move) >= 0.25 && (m.revenue > 0 || m.prevRevenue > 0)) {
+      cards.push({
+        id: `mover-${m.dim}-${label}`,
+        kind: 'mover',
+        title: `${label} revenue ${fmtSignedPct(move)}`,
+        detail: `Biggest ${m.noun} mover vs prior period`,
+        sentiment: move >= 0 ? 'up' : 'down',
+        filter: { key: m.filter, value: m.label ?? '' },
+        score: Math.abs(move) * 70 + (m.revenue / Math.max(c.revenue, 1)) * 40,
+      });
+    }
+  }
+
+  cards.sort((a, b) => b.score - a.score);
+  const seen = new Set<string>();
+  const out: Insight[] = [];
+  for (const card of cards) {
+    const key = card.filter ? `${card.filter.key}:${card.filter.value}` : card.id;
+    if (seen.has(key) && card.kind !== 'kpi') continue;
+    seen.add(key);
+    out.push(card);
+    if (out.length >= 5) break;
+  }
+  return out;
+}
+
+/** Rule-based insight cards for the selected range/filters. */
+export async function insights(ctx: Ctx): Promise<Insight[]> {
+  const ov = await overview(ctx);
+  const movers: { dim: string; filter: string; noun: string; label: string | null; revenue: number; prevRevenue: number; visitors: number }[] = [];
+  const span = ctx.range.to - ctx.range.from;
+  const prevFrom = ctx.range.from - span;
+
+  for (const d of INSIGHT_DIMS) {
+    const [curRows, prevRows] = await Promise.all([
+      breakdown(ctx, d.dim, 8),
+      breakdown({ ...ctx, range: { ...ctx.range, from: prevFrom, to: ctx.range.from } }, d.dim, 8),
+    ]);
+    const prevMap = new Map(prevRows.map((r) => [r.label, r.revenue]));
+    for (const row of curRows.slice(0, 5)) {
+      movers.push({
+        dim: d.dim,
+        filter: d.filter,
+        noun: d.noun,
+        label: row.label,
+        revenue: row.revenue,
+        prevRevenue: prevMap.get(row.label) ?? 0,
+        visitors: row.visitors,
+      });
+    }
+    // Also catch big drop-offs that disappeared from the top.
+    for (const row of prevRows.slice(0, 3)) {
+      if (curRows.some((r) => r.label === row.label)) continue;
+      movers.push({
+        dim: d.dim,
+        filter: d.filter,
+        noun: d.noun,
+        label: row.label,
+        revenue: 0,
+        prevRevenue: row.revenue,
+        visitors: 0,
+      });
+    }
+  }
+
+  return rankInsights({ current: ov.current, previous: ov.previous, movers });
+}
+
+function csvEscape(v: unknown): string {
+  const s = v == null ? '' : String(v);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function toCsv(headers: string[], rows: unknown[][]): string {
+  return [headers.map(csvEscape).join(','), ...rows.map((r) => r.map(csvEscape).join(','))].join('\n') + '\n';
+}
+
+/** CSV export for overview series, a breakdown dimension, or customers. */
+export async function exportCsv(ctx: Ctx, kind: string, dim = 'source'): Promise<{ filename: string; body: string }> {
+  const site = ctx.site.domain.replace(/[^a-z0-9.-]+/gi, '_');
+  const day = new Date(ctx.range.to).toISOString().slice(0, 10);
+  if (kind === 'overview') {
+    const ov = await overview(ctx);
+    return {
+      filename: `${site}-overview-${day}.csv`,
+      body: toCsv(
+        ['bucket', 'visitors', 'visitors_prev', 'pageviews', 'revenue', 'revenue_prev', 'payments'],
+        ov.series.map((r) => [r.bucket, r.visitors, r.visitors_prev, r.pageviews, r.revenue, r.revenue_prev, r.payments]),
+      ),
+    };
+  }
+  if (kind === 'breakdown') {
+    const rows = await breakdown(ctx, dim, 500);
+    return {
+      filename: `${site}-${dim}-${day}.csv`,
+      body: toCsv(
+        ['label', 'visitors', 'pageviews', 'revenue', 'customers'],
+        rows.map((r) => [r.label ?? '', r.visitors, r.pageviews ?? '', r.revenue, r.customers]),
+      ),
+    };
+  }
+  if (kind === 'customers') {
+    const rows = (await customers(ctx)) as any[];
+    return {
+      filename: `${site}-customers-${day}.csv`,
+      body: toCsv(
+        ['ts', 'amount', 'currency', 'email', 'name', 'source', 'channel', 'campaign', 'country', 'matched_by', 'visitor_id'],
+        rows.map((r) => [
+          r.ts,
+          r.amount,
+          r.currency,
+          r.pay_email ?? r.email ?? '',
+          r.pay_name ?? r.name ?? '',
+          r.source ?? '',
+          r.channel ?? '',
+          r.utm_campaign ?? '',
+          r.country ?? '',
+          r.matched_by ?? '',
+          r.visitor_id ?? '',
+        ]),
+      ),
+    };
+  }
+  throw new Error('kind must be overview, breakdown, or customers');
+}
+
+/** Plain-text period summary for clipboard copy. */
+export function formatPeriodSummary(input: {
+  siteName: string;
+  periodLabel: string;
+  currency: string;
+  decimals: number;
+  current: ReturnType<typeof kpis>;
+  previous: ReturnType<typeof kpis>;
+  insights: Insight[];
+  money: (minor: number) => string;
+}): string {
+  const { current: c, previous: p, insights: cards, money } = input;
+  const lines = [
+    `${input.siteName} · ${input.periodLabel}`,
+    `Visitors: ${c.visitors} (${c.newVisitors} new / ${c.returningVisitors} returning)`,
+    `Revenue: ${money(c.revenue)} · Conversion: ${(c.conversionRate * 100).toFixed(1)}%`,
+  ];
+  const revPct = pctChange(c.revenue, p.revenue);
+  if (revPct !== null) lines.push(`Revenue vs prior: ${fmtSignedPct(revPct)}`);
+  if (cards.length) {
+    lines.push('', 'Insights:');
+    for (const card of cards.slice(0, 5)) lines.push(`• ${card.title}${card.detail ? ` — ${card.detail}` : ''}`);
+  }
+  return lines.join('\n');
 }
